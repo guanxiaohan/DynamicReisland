@@ -86,9 +86,13 @@ class DynamicReisland:
     def __init__(self):
         log("Starting Dynamic Reisland")
 
-        log("Initializing Manager...")
+        log("Initializing Managers...")
+        self.DataBus = DataBus()
+        self.EventBus = EventBus()
+        self.TaskBus = TaskBus(self, max_workers=6, overload_threshold=16)
+        self.ServiceBus = ServiceBus(self.DataBus, self.EventBus, self.TaskBus, self)
         self.UIManager = UIManager()
-
+        
         log("Loading Extensions...")
         self.ExtensionHost = ExtensionHost(self)
         self.ExtensionHost.loadExtensions()

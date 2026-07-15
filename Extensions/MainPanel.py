@@ -10,5 +10,8 @@ class MainExtension(DI_Extension.Extension):
             "Perplexity"
         )
     
+    def initExtension(self):
+        ...
+    
 def extension_entry():
     return MainExtension()
