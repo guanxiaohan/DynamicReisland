@@ -558,7 +558,7 @@ class EventBus(QObject):
         for func in to_call:
             func(*args, **kwargs)
 
-    def removeSignal(self, signal_id_or_object: UUID | object):
+    def removeSignal(self, signal_id_or_object: "UUID | EventBus.DRI_Signal"):
         if isinstance(signal_id_or_object, EventBus.DRI_Signal):
             signal_id = signal_id_or_object.signal_id
         elif isinstance(signal_id_or_object, UUID):
@@ -624,7 +624,8 @@ class DataBus:
     
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._subjects: dict[int, str] = {}    # id(subject) -> "namespace"
+        self._subjects: dict[int, str] = {}
+        self._namespace_members: dict[str, set[int]] = {}  # namespace -> {subject_ids}
         self._storage: dict[str, Any] = {}     # "namespace.key" -> value
         self._metadata: dict[str, DataBus.KeyMetadata] = {}   # "namespace.key" -> 权限、类型及绑定的信号元数据
 
@@ -637,22 +638,24 @@ class DataBus:
             return ns
 
     def registerObject(self, subject: object, namespace_or_identifier: str, _id: str | None = None) -> None:
-        """
-        向 DataBus 注册主体，锁定主权命名空间。
-        """
         namespace, _ = normalizeIdentifier(namespace_or_identifier, _id)
 
         with self._lock:
-            for sid, claimed_ns in self._subjects.items():
-                if claimed_ns == namespace and sid != id(subject):
-                    raise ValueError(f"Security Alert: Namespace '{namespace}' has already been claimed by another object.")
-            self._subjects[id(subject)] = namespace
+            sid = id(subject)
+
+            # 允许多个对象共享同一 namespace
+            self._subjects[sid] = namespace
+
+            if namespace not in self._namespace_members:
+                self._namespace_members[namespace] = set()
+
+            self._namespace_members[namespace].add(sid)
 
     def initKey(self, subject: object, key: str, 
                 read_restriction: tuple[str, ...] | None = None, 
                 write_restriction: tuple[str, ...] | None = None, 
                 type_validation: type | None = None,
-                send_signal: Any = None,
+                send_signal: EventBus.DRI_Signal | None = None,
                 send_signal_with_value: bool = False) -> None:
         """
         初始化键值，并可选地绑定一个 EventBus 的 Signal。
@@ -811,6 +814,7 @@ class TaskBus:
         self.parent = parent
         self._lock = threading.RLock()
         self._subjects: dict[int, str] = {}
+        self._namespace_members: dict[str, set[int]] = {}  # namespace -> {subject_ids}
         self._active_threads: dict[UUID, threading.Thread] = {}
         
         # 线程池相关配置
@@ -821,26 +825,32 @@ class TaskBus:
         # 精确追踪池内正在排队（已被 submit 但尚未被 Worker 消费）的任务数量
         self._queued_in_pool = 0 
 
-    def registerObject(self, subject: object, namespace_or_identifier: str, _id: str | None = None):
+    def registerObject(self, subject: object, namespace_or_identifier: str, _id: str | None = None) -> None:
         namespace, _ = normalizeIdentifier(namespace_or_identifier, _id)
+
         with self._lock:
-            for sid, claimed_ns in self._subjects.items():
-                if claimed_ns == namespace and sid != id(subject):
-                    raise ValueError(f"Security Alert: Namespace '{namespace}' has already been claimed.")
-            self._subjects[id(subject)] = namespace
+            sid = id(subject)
+
+            # 允许多个对象共享同一 namespace
+            self._subjects[sid] = namespace
+
+            if namespace not in self._namespace_members:
+                self._namespace_members[namespace] = set()
+
+            self._namespace_members[namespace].add(sid)
 
     def _verifySubject(self, subject: object):
         with self._lock:
             if id(subject) not in self._subjects:
                 raise PermissionError("Access Denied: Subject is not registered to TaskBus.")
 
-    def createTask(self, subject: object, func: Callable, *args, **kwargs) -> Task:
+    def createTask(self, subject: object, target: "Callable | TaskBus.TaskInstance", *args, **kwargs) -> Task:
         self._verifySubject(subject)
         task_id = uuid4()
         return self.Task(
             ID=task_id,
             parent=self,
-            func=func,
+            func=target,
             state=self.Task.State.Pending,
             onetime=True,
             args=args,
@@ -971,82 +981,82 @@ class TaskBus:
                     task.func.terminateFlag = True
     
 class NetworkTask:
-        @dataclasses.dataclass
-        class Response:
-            status_code: int
-            content: bytes
-            headers: dict = dataclasses.field(default_factory=dict)
+    @dataclasses.dataclass
+    class Response:
+        status_code: int
+        content: bytes
+        headers: dict = dataclasses.field(default_factory=dict)
 
-            @property
-            def text(self) -> str:
-                return self.content.decode('utf-8', errors='ignore')
+        @property
+        def text(self) -> str:
+            return self.content.decode('utf-8', errors='ignore')
 
-        # 网络任务的具体执行实例
-        class Instance(TaskBus.TaskInstance):
-            def __init__(self, method: str, url: str, headers: dict | None = None, timeout: float = 15, retry: int = 0, data: bytes | None = None):
-                super().__init__()
-                self.method = method
-                self.url = url
-                self.headers = headers or {}
-                self.timeout = timeout
-                self.retry = retry
-                self.data = data
+    # 网络任务的具体执行实例
+    class Instance(TaskBus.TaskInstance):
+        def __init__(self, method: str, url: str, headers: dict | None = None, timeout: float = 15, retry: int = 0, data: bytes | None = None):
+            super().__init__()
+            self.method = method
+            self.url = url
+            self.headers = headers or {}
+            self.timeout = timeout
+            self.retry = retry
+            self.data = data
 
-            def run(self):
-                attempts = self.retry + 1
-                for attempt in range(attempts):
-                    # 每次尝试前检测是否已被要求终止
-                    if self.terminateFlag:
-                        break
-                    
-                    try:
-                        req = urllib.request.Request(
-                            self.url, 
-                            headers=self.headers, 
-                            method=self.method, 
-                            data=self.data
+        def run(self):
+            attempts = self.retry + 1
+            for attempt in range(attempts):
+                # 每次尝试前检测是否已被要求终止
+                if self.terminateFlag:
+                    break
+                
+                try:
+                    req = urllib.request.Request(
+                        self.url, 
+                        headers=self.headers, 
+                        method=self.method, 
+                        data=self.data
+                    )
+                    # 发起请求
+                    with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                        if self.terminateFlag:
+                            break
+                        self.result = NetworkTask.Response(
+                            status_code=response.status,
+                            content=response.read(),
+                            headers=dict(response.info())
                         )
-                        # 发起请求
-                        with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                            if self.terminateFlag:
-                                break
-                            self.result = NetworkTask.Response(
-                                status_code=response.status,
-                                content=response.read(),
-                                headers=dict(response.info())
-                            )
-                            return self.result
-                    except urllib.error.HTTPError as e:
-                        # 4xx / 5xx 错误视为“有响应结果”的请求
-                        if attempt == attempts - 1 or self.terminateFlag:
-                            self.result = NetworkTask.Response(
-                                status_code=e.code,
-                                content=e.read(),
-                                headers=dict(e.headers)
-                            )
-                            return self.result
-                    except Exception as e:
-                        # 物理断网、DNS 失败或超时
-                        if attempt == attempts - 1 or self.terminateFlag:
-                            raise e
-                        
-                        # 重试等待期间优雅响应退出事件
-                        log(f"[NetworkTask] Attempt {attempt + 1} failed. Retrying...")
-                        for _ in range(20):  # 将 2 秒重试拆分为 20 次 0.1 秒的微等待
-                            if self.terminateFlag:
-                                break
-                            time.sleep(0.1)
+                        return self.result
+                except urllib.error.HTTPError as e:
+                    # 4xx / 5xx 错误视为“有响应结果”的请求
+                    if attempt == attempts - 1 or self.terminateFlag:
+                        self.result = NetworkTask.Response(
+                            status_code=e.code,
+                            content=e.read(),
+                            headers=dict(e.headers)
+                        )
+                        return self.result
+                except Exception as e:
+                    # 物理断网、DNS 失败或超时
+                    if attempt == attempts - 1 or self.terminateFlag:
+                        raise e
+                    
+                    # 重试等待期间优雅响应退出事件
+                    log(f"[NetworkTask] Attempt {attempt + 1} failed. Retrying...")
+                    for _ in range(20):  # 将 2 秒重试拆分为 20 次 0.1 秒的微等待
+                        if self.terminateFlag:
+                            break
+                        time.sleep(0.1)
 
-        # 静态便利工厂方法
-        @classmethod
-        def get(cls, bus: "TaskBus", subject: object, url: str, headers: dict | None = None, timeout: float = 15, retry: int = 0) -> "TaskBus.Task":
-            task_instance = cls.Instance("GET", url, headers, timeout, retry)
-            return bus.createReusableTask(subject, task_instance)
+    # 静态便利工厂方法
+    @classmethod
+    def get(cls, bus: "TaskBus", subject: object, url: str, headers: dict | None = None, timeout: float = 15, retry: int = 0) -> "TaskBus.Task":
+        task_instance = cls.Instance("GET", url, headers, timeout, retry)
+        return bus.createReusableTask(subject, task_instance)
 
-        @classmethod
-        def post(cls, bus: "TaskBus", subject: object, url: str, headers: dict | None = None, data: bytes | None = None, timeout: float = 15, retry: int = 0) -> "TaskBus.Task":
-            task_instance = cls.Instance("POST", url, headers, timeout, retry, data)
-            return bus.createReusableTask(subject, task_instance)
+    @classmethod
+    def post(cls, bus: "TaskBus", subject: object, url: str, headers: dict | None = None, data: bytes | None = None, timeout: float = 15, retry: int = 0) -> "TaskBus.Task":
+        task_instance = cls.Instance("POST", url, headers, timeout, retry, data)
+        return bus.createReusableTask(subject, task_instance)
         
 class Service:
     class State(IntEnum):
@@ -1061,7 +1071,7 @@ class Service:
         permanentTick: bool = False
         timer: float = -1
         autoStart: bool = True
-        dependencies: tuple[str, ...] = ()  # 核心升级：依赖标识符元组
+        dependencies: tuple[str, ...] = ()
 
     def __init__(self, serviceIdentifier: str, policy: Policy):
         self.ID: UUID = uuid4()
@@ -1070,10 +1080,10 @@ class Service:
         self.state: Service.State = self.State.Stopped
         self.enabled: bool = True
 
-        self.dataBus: DataBus | None = None
-        self.eventBus: EventBus | None = None
-        self.taskBus: TaskBus | None = None
-        self._bus: "ServiceBus | None" = None  # 内部持有总线引用以执行拓扑查询
+        self.dataBus: DataBus
+        self.eventBus: EventBus
+        self.taskBus: TaskBus
+        self._bus: ServiceBus
 
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
@@ -1086,11 +1096,11 @@ class Service:
         self.taskBus = taskBus
         self._bus = bus
 
+    def initService(self): pass
     def onStart(self): pass
     def tick(self): pass
     def onStop(self): pass
 
-    # --- 启停方法升级：支持连锁与发起者溯源 ---
     def start(self, cascade: bool = True, initiator: str | None = None, _visited: set[str] | None = None):
         with self._lock:
             if not self.enabled:
@@ -1165,7 +1175,7 @@ class Service:
             if self.state in (self.State.Stopped, self.State.Stopping):
                 return True
             
-            # 向总线申请依赖树的连锁终止（先停掉依赖我的服务）
+            # 向总线申请依赖树的连锁终止（先停掉依赖的服务）
             if self._bus and not self._bus._ensure_dependencies_stop(self, cascade, initiator, _visited):
                 log(f"Stop aborted for '{self.identifier}': Dependent services refused to stop.")
                 return False
@@ -1181,7 +1191,7 @@ class Service:
                 self.state = self.State.Stopped
             return True
 
-    def restart(self, cascade: bool = True, initiator: str | None = None):
+    def restart(self, cascade: bool = False, initiator: str | None = None):
         log(f"Restarting service '{self.identifier}'...")
         if self.stop(cascade, initiator):
             if self._thread is not None:
@@ -1202,7 +1212,6 @@ class ServiceBus:
         self._master_thread = threading.Thread(target=self._bus_master_loop, name="ServiceBus-Master", daemon=True)
         self._master_thread.start()
 
-    # --- 🛡️ 安全验证策略 ---
     def _verify_cascade_permission(self, initiator: str | None, target: str) -> bool:
         """验证命名空间权限，支持未来基于规则表扩展"""
         if not initiator: 
@@ -1213,12 +1222,11 @@ class ServiceBus:
 
         # 核心规则：外部命名空间不能连锁启停 DynamicReisland 命名空间
         if target_ns == "DynamicReisland" and init_ns != "DynamicReisland":
-            log(f"⚠️ Security Alert: '{initiator}' lacks permission to cascade '{target}'.")
+            log(f"Security Alert: '{initiator}' lacks permission to cascade '{target}'.")
             return False
             
         return True
 
-    # --- 🕸️ 拓扑依赖解析与连锁流转 ---
     def _ensure_dependencies_start(self, service: Service, cascade: bool, initiator: str | None, visited: set[str] | None = None) -> bool:
         """确保要启动的服务的所有依赖项都已在运行"""
         visited = visited or set()
@@ -1304,6 +1312,7 @@ class ServiceBus:
             # 注入总线引用
             service.loadGlobalAssets(self.dataBus, self.eventBus, self.taskBus, self)
             self._services[service.ID] = service
+            service.initService()
             log(f"Registered '{service.identifier}' (Dependencies: {service.policy.dependencies})")
 
             # 在注册阶段自动启动时，赋予系统级最高权限，允许无视命名空间安全规则的拓扑唤醒
@@ -1331,7 +1340,7 @@ class ServiceBus:
                 return None
             raise LookupError(f"Could not resolve service: '{identifier_or_service}'")
 
-    # 对外暴露的极简 API
+    # API
     def startService(self, identifier: Union[Service, str, UUID], cascade: bool = True):
         self._resolveService(identifier).start(cascade=cascade, initiator=None) # type: ignore
     

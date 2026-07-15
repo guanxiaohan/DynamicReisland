@@ -24,6 +24,11 @@ class ExtensionHost(QObject):
         super().__init__()
 
         self._parent = parent
+        self.eventBus = self._parent.EventBus
+        self.dataBus = self._parent.DataBus
+        self.taskBus = self._parent.TaskBus
+        self.serviceBus = self._parent.ServiceBus
+
         self.extensions: dict[UUID, DI_Extension.Extension] = {}
 
     def loadExtensions(self):
@@ -62,8 +67,29 @@ class ExtensionHost(QObject):
             except Exception as err:
                 error(f"Failed to read extension metadata of", x)
                 continue
+            
+            self._parent.registerObject(extension, extensionInfo.namespace + ".mainExtension")
+
+            extension.initInterface(
+                self._parent.registerObject,
+                self.taskBus.createTask,
+                self.taskBus.createReusableTask,
+                self.serviceBus.registerService,
+                self.serviceBus.startService,
+                self.serviceBus.stopService,
+                self.dataBus.initKey,
+                self.dataBus.get,
+                self.dataBus.set, 
+                self.eventBus.subscribe,
+                self.eventBus.unsubscribe,
+                self.eventBus.register,
+                self.eventBus.removeEvent,
+                self.eventBus.removeSignal
+            )
 
             self.extensions[uuid4()] = extension
+            log("Starting up extension:", extensionInfo.name)
+            extension.initExtension()
             log("Extension initialized:", extensionInfo)
 
 
@@ -96,6 +122,10 @@ class DynamicReisland:
         log("Loading Extensions...")
         self.ExtensionHost = ExtensionHost(self)
         self.ExtensionHost.loadExtensions()
+
+    def registerObject(self, subject: object, namespace_or_identifier: str, _id: str | None = None) -> None:
+        self.DataBus.registerObject(subject, namespace_or_identifier, _id)
+        self.TaskBus.registerObject(subject, namespace_or_identifier, _id)
 
     
 if __name__ == "__main__":
