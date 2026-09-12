@@ -1,19 +1,24 @@
-import Utils
-import Widgets
-import Island
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, final, TypeVar, Protocol, Any, Union, Optional, Iterable
+from typing import (Any, Callable, Iterable, Optional, Protocol, TypeVar,
+                    Union, final)
 
-from Utils import log, warning, error, classLog, classWarning, classError
+import Island
+import Utils
+import Widgets
+from Utils import classError, classLog, classWarning, error, log, warning
+
 
 @dataclass
 class ExtensionInfo:
     name: str
-    namespace: str
+    identifier: str
     version: str
     author: str
+
+    def __post_init__(self):
+        Utils.validateName(self.identifier)
+        self.namespace = Utils.normalizeIdentifier(self.identifier)[0]
 
 class RegisterObjectProtocol(Protocol):
     def __call__(self, subject: object, namespace_or_identifier: str, _id: str | None = None):
@@ -68,7 +73,8 @@ class Extension(ABC):
                       unsubscribe: UnsubscribeProtocol,
                       registerEvent: RegisterEventSignal,
                       removeEvent: RemoveEventProtocol,
-                      removeSignal: Callable[[Utils.UUID | Utils.EventBus.DRI_Signal], None]):
+                      removeSignal: Callable[[Utils.UUID | Utils.EventBus.DRI_Signal], None],
+                      registerPanel: Callable[[object, Widgets.Panel], None]):
         
         self.registerObject = registerObject
         self.createTask = createTask
@@ -84,6 +90,7 @@ class Extension(ABC):
         self.registerEvent = registerEvent
         self.removeEvent = removeEvent
         self.removeSignal = removeSignal
+        self.registerPanel = registerPanel
 
 
     @abstractmethod

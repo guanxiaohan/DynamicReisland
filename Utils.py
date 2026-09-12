@@ -1,22 +1,23 @@
-from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import inspect
 import logging
 import pathlib
 import threading
-import weakref
-import urllib.request
-import urllib.error
 import time
-from enum import IntEnum
+import urllib.error
+import urllib.request
+import weakref
+from concurrent.futures import ThreadPoolExecutor
+from enum import IntEnum, IntFlag
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Union, overload
+from typing import Any, Callable, Iterable, Union
 from uuid import UUID, uuid4
 
+from Constants import *
 from PySide6.QtCore import (QEasingCurve, QObject, QParallelAnimationGroup,
                             QPoint, QPropertyAnimation, QRect,
-                            QSequentialAnimationGroup, QVariantAnimation,
-                            Signal, SignalInstance)
+                            QSequentialAnimationGroup, QSize,
+                            QVariantAnimation, Signal, SignalInstance)
 from PySide6.QtGui import QGuiApplication
 
 RootDir = pathlib.Path(__file__).resolve().parent
@@ -75,16 +76,22 @@ def validateName(name: Any):
     if not isinstance(name, str):
         return False
     
-    return all((x not in name for x in ", !%$.\"[]{}&*"))
+    return all((x not in name for x in ", !%$\"[]{}&*"))
 
 @dataclasses.dataclass
-class screenState:
+class ScreenState:
     geometry: QRect
     logicalDPI: float
 
+    def __post_init__(self):
+        self.hCenter = int(self.geometry.width() / 2)
+        self.vCenter = int(self.geometry.height() / 2)
+        self.cameraRect = QRect(QPoint(), QSize(CameraDiameter, CameraDiameter))
+        self.cameraRect.moveCenter(QPoint(self.hCenter, CameraY))
+
 def acquireScreenState():
     screen = QGuiApplication.primaryScreen()
-    return screenState(
+    return ScreenState(
         screen.geometry(),
         screen.logicalDotsPerInch()
     )
@@ -303,7 +310,7 @@ class AnimationBus(QObject):
         self.ongoingAnimations.remove(instance)
         for x in instance.QtAnimationIDs:
             self.QtAnimations[x].finished.disconnect(instance.animationFinished)
-        log("Animation instance finished:", instance)
+        classLog(self, "Animation instance finished:", instance)
         self.checkQueue()
 
     def forceStart(self, animation: Animation | UUID | AnimationGroup):
@@ -388,7 +395,7 @@ class AnimationBus(QObject):
 
         for x in instance.QtAnimationIDs:
             self.QtAnimations[x].start()
-            log("Animation instance started:", instance)
+            classLog(self, "Animation instance started:", instance)
 
     def stopInstance(self, instance: AnimationInstance):
         if instance.completed:
@@ -664,7 +671,7 @@ class DataBus:
                             若该信号要求参数 (arg_count > 0)，触发时会自动带上新写入的 value。
         """
         ns = self._get_verified_ns(subject)
-        global_key = f"{ns}.{key}"
+        global_key = key if key.startswith(ns + '.') else f"{ns}.{key}"
 
         with self._lock:
             if global_key in self._storage:
@@ -684,7 +691,7 @@ class DataBus:
         设定属性值。若绑定的数据发生实质性变化 (value 改变)，将自动通过绑定的信号向外弹射。
         """
         ns = self._get_verified_ns(subject)
-        global_key = key if "." in key else f"{ns}.{key}"
+        global_key = key if key.startswith(ns + '.') else f"{ns}.{key}"
 
         signal_to_emit = None
         emit_with_value = False
@@ -729,7 +736,7 @@ class DataBus:
         带有主动容器沙箱防御，防止外部直接对返回的复杂对象进行恶意魔改。
         """
         ns = self._get_verified_ns(subject)
-        global_key = key if "." in key else f"{ns}.{key}"
+        global_key = key if key.startswith(ns + '.') else f"{ns}.{key}"
 
         with self._lock:
             if global_key not in self._storage:
@@ -1070,7 +1077,7 @@ class Service:
         dedicatedThread: bool = False
         permanentTick: bool = False
         timer: float = -1
-        autoStart: bool = True
+        autoStart: bool = False
         dependencies: tuple[str, ...] = ()
 
     def __init__(self, serviceIdentifier: str, policy: Policy):
@@ -1127,7 +1134,7 @@ class Service:
                     self.state = self.State.Running
                     if self.policy.timer <= 0:
                         self.tick()
-                        self._cleanup_after_run()
+                        # self._cleanup_after_run()
                     else:
                         self._last_tick_time = time.time()
                 except Exception as e:
@@ -1209,7 +1216,7 @@ class ServiceBus:
         self._services: dict[UUID, Service] = {}
 
         self._bus_stop_event = threading.Event()
-        self._master_thread = threading.Thread(target=self._bus_master_loop, name="ServiceBus-Master", daemon=True)
+        self._master_thread = threading.Thread(target=self._bus_master_loop, name="ServiceMain", daemon=True)
         self._master_thread.start()
 
     def _verify_cascade_permission(self, initiator: str | None, target: str) -> bool:
@@ -1238,7 +1245,7 @@ class ServiceBus:
             for dep_id in service.policy.dependencies:
                 dep_svc = self._resolveService(dep_id, safe=True)
                 if not dep_svc:
-                    log(f"Missing required dependency '{dep_id}' for '{service.identifier}'.")
+                    classError(self, f"Missing required dependency '{dep_id}' for '{service.identifier}'.")
                     return False
 
                 if dep_svc.state != Service.State.Running:
@@ -1290,7 +1297,7 @@ class ServiceBus:
                         try:
                             svc.tick()
                         except Exception as e:
-                            log(f"Error in polled service '{svc.identifier}': {e}")
+                            error(f"Error in polled service '{svc.identifier}': {e}")
                         finally:
                             svc._last_tick_time = time.time()
             self._bus_stop_event.wait(0.01)
@@ -1313,7 +1320,7 @@ class ServiceBus:
             service.loadGlobalAssets(self.dataBus, self.eventBus, self.taskBus, self)
             self._services[service.ID] = service
             service.initService()
-            log(f"Registered '{service.identifier}' (Dependencies: {service.policy.dependencies})")
+            classLog(self, f"Registered service: {service.identifier} (Dependencies: {', '.join(service.policy.dependencies) if service.policy.dependencies else 'None'})")
 
             # 在注册阶段自动启动时，赋予系统级最高权限，允许无视命名空间安全规则的拓扑唤醒
             if service.policy.autoStart and service.enabled:
